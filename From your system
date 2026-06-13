@@ -1,0 +1,1121 @@
+from flask import Flask, render_template_string, request, redirect, session, send_from_directory, jsonify, abort
+from werkzeug.security import generate_password_hash, check_password_hash
+from werkzeug.utils import secure_filename
+import sqlite3, os, uuid, secrets, html, re, time, threading, random
+from datetime import datetime, timedelta
+from functools import wraps
+
+app = Flask(__name__)
+app.secret_key = os.environ.get('SECRET_KEY', secrets.token_hex(64))
+
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE='Strict',
+    SESSION_COOKIE_SECURE=os.environ.get('FLASK_ENV') == 'production',
+    MAX_CONTENT_LENGTH=5 * 1024 * 1024,
+    PERMANENT_SESSION_LIFETIME=timedelta(hours=6),
+    UPLOAD_FOLDER='uploads'
+)
+os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+
+DATABASE = 'greeths.db'
+ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'webp'}
+
+login_attempts = {}
+typing_status = {}
+lock = threading.Lock()
+demo_users = {}  # Store demo users in memory
+
+def rate_limit(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        ip = request.remote_addr
+        now = datetime.now()
+        with lock:
+            if ip in login_attempts:
+                attempts, last_time = login_attempts[ip]
+                if attempts >= 5 and (now - last_time).seconds < 300:
+                    return "Too many attempts. Wait 5 minutes.", 429
+                if attempts >= 20 and (now - last_time).seconds < 3600:
+                    return "Blocked for 1 hour due to abuse.", 403
+        return func(*args, **kwargs)
+    return wrapper
+
+def get_db():
+    conn = sqlite3.connect(DATABASE, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA journal_mode=WAL")
+    return conn
+
+def init_db():
+    conn = get_db()
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            full_name TEXT NOT NULL,
+            email TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            profile_pic TEXT DEFAULT 'default.png',
+            bio TEXT DEFAULT '',
+            theme_color TEXT DEFAULT '#00c853',
+            username TEXT UNIQUE,
+            gender TEXT DEFAULT 'M',
+            age INTEGER DEFAULT 18,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS posts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            content TEXT,
+            image_path TEXT,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+        CREATE TABLE IF NOT EXISTS reactions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            post_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            reaction_type TEXT DEFAULT 'heart',
+            UNIQUE(post_id, user_id, reaction_type),
+            FOREIGN KEY(post_id) REFERENCES posts(id) ON DELETE CASCADE,
+            FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+        CREATE TABLE IF NOT EXISTS comments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            post_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            content TEXT,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(post_id) REFERENCES posts(id) ON DELETE CASCADE,
+            FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+        CREATE TABLE IF NOT EXISTS comment_reactions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            comment_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            reaction_type TEXT DEFAULT 'heart',
+            UNIQUE(comment_id, user_id, reaction_type),
+            FOREIGN KEY(comment_id) REFERENCES comments(id) ON DELETE CASCADE,
+            FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+        CREATE TABLE IF NOT EXISTS messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            from_user INTEGER NOT NULL,
+            to_user INTEGER NOT NULL,
+            content TEXT,
+            image_path TEXT,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            is_read INTEGER DEFAULT 0,
+            FOREIGN KEY(from_user) REFERENCES users(id) ON DELETE CASCADE,
+            FOREIGN KEY(to_user) REFERENCES users(id) ON DELETE CASCADE
+        );
+        CREATE TABLE IF NOT EXISTS message_reactions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            message_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            reaction_type TEXT DEFAULT 'heart',
+            UNIQUE(message_id, user_id, reaction_type),
+            FOREIGN KEY(message_id) REFERENCES messages(id) ON DELETE CASCADE,
+            FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+        CREATE TABLE IF NOT EXISTS followers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            follower_id INTEGER NOT NULL,
+            UNIQUE(user_id, follower_id),
+            FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
+            FOREIGN KEY(follower_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+    """)
+    conn.commit()
+    conn.close()
+
+init_db()
+
+# Generate 100+ demo users
+def generate_demo_users():
+    first_names = ["Alex", "Jordan", "Casey", "Taylor", "Morgan", "Riley", "Avery", "Quinn", "Jamie", "Cameron",
+                   "Blake", "Dakota", "Skyler", "Parker", "River", "Sage", "Phoenix", "Dakota", "Aspen", "Storm",
+                   "Kai", "Rory", "Emerson", "Drew", "Shawn", "Casey", "Finley", "Rowan", "Jayden", "Reese",
+                   "Cody", "Peyton", "Bailey", "Harper", "Addison", "Olive", "Aria", "Stella", "Aurora", "Zoe",
+                   "Sophia", "Emma", "Olivia", "Ava", "Isabella", "Mia", "Charlotte", "Amelia", "Evelyn", "Abigail",
+                   "Harper", "Ella", "Madison", "Scarlett", "Victoria", "Grace", "Chloe", "Camila", "Penelope", "Riley",
+                   "Liam", "Noah", "Oliver", "Elijah", "James", "William", "Benjamin", "Lucas", "Henry", "Alexander",
+                   "Mason", "Michael", "Ethan", "Daniel", "Jacob", "Logan", "Jackson", "Sebastian", "Aiden", "Matthew",
+                   "Samuel", "David", "Joseph", "Carter", "Owen", "Wyatt", "Albert", "Jayden", "Mark", "Aaron",
+                   "Charles", "Andrew", "Ryan", "Kevin", "Brian", "George", "Edward", "Ronald", "Anthony", "Frank",
+                   "Thomas", "Harold", "Carlos", "Oscar", "Jorge", "Jesse", "Roger", "Dennis", "Jerry", "Tyler",
+                   "Aaron", "Jose", "Adam", "Henry", "Douglas", "Peter", "Zachary", "Kyle", "Eric", "Brian"]
+    
+    last_names = ["Smith", "Johnson", "Williams", "Brown", "Jones", "Garcia", "Miller", "Davis", "Rodriguez", "Martinez",
+                  "Hernandez", "Lopez", "Gonzalez", "Wilson", "Anderson", "Thomas", "Taylor", "Moore", "Jackson", "Martin",
+                  "Lee", "Perez", "Thompson", "White", "Harris", "Sanchez", "Clark", "Ramirez", "Lewis", "Robinson",
+                  "Young", "Allen", "King", "Wright", "Scott", "Torres", "Peterson", "Phillips", "Campbell", "Parker",
+                  "Evans", "Edwards", "Collins", "Reeves", "Stewart", "Morris", "Morales", "Beck", "Grant", "Stevens"]
+    
+    first_names_extended = first_names + ["Sam", "Pat", "Chris", "Robin", "Morgan", "Angel", "Dakota", "Sky", "Rain", "Storm"]
+    
+    all_users = []
+    for i in range(120):
+        first = random.choice(first_names_extended)
+        last = random.choice(last_names)
+        gender = random.choice(['M', 'F'])
+        age = random.randint(18, 50)
+        email = f"demo{i}_{random.randint(1000,9999)}@greeths.com"
+        username = f"{first.lower()}{last.lower()}{random.randint(100,999)}"
+        
+        all_users.append({
+            'name': f"{first} {last}",
+            'email': email,
+            'username': username,
+            'gender': gender,
+            'age': age,
+            'password': 'Demo@123!'
+        })
+    
+    return all_users
+
+def create_demo_users_in_db():
+    """Create demo users in database"""
+    conn = get_db()
+    demo_data = generate_demo_users()
+    
+    for user in demo_data:
+        try:
+            conn.execute("""
+                INSERT INTO users (full_name, email, password_hash, username, gender, age)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (user['name'], user['email'], generate_password_hash(user['password'], method='scrypt'), 
+                  user['username'], user['gender'], user['age']))
+        except sqlite3.IntegrityError:
+            pass
+    
+    conn.commit()
+    
+    # Add some demo interactions
+    users = conn.execute("SELECT id FROM users LIMIT 150").fetchall()
+    user_ids = [u['id'] for u in users]
+    
+    if len(user_ids) > 2:
+        # Create some posts from random users
+        for i in range(min(80, len(user_ids))):
+            user_id = random.choice(user_ids)
+            content = random.choice([
+                "Just had an amazing day! 🌟",
+                "Love this weather! ☀️",
+                "Coffee is life ☕",
+                "Feeling blessed today!",
+                "New project coming soon! 🚀",
+                "Anyone want to grab lunch?",
+                "Just finished a great workout!",
+                "Movie night anyone?",
+                "Life is good!",
+                "Can't wait for the weekend! 🎉"
+            ])
+            conn.execute("INSERT INTO posts (user_id, content) VALUES (?, ?)", (user_id, content))
+        
+        conn.commit()
+        
+        # Add some reactions to posts
+        posts = conn.execute("SELECT id FROM posts").fetchall()
+        post_ids = [p['id'] for p in posts]
+        
+        for post_id in post_ids[:50]:
+            for _ in range(random.randint(1, 5)):
+                reactor_id = random.choice(user_ids)
+                reaction_type = random.choice(['heart', 'star'])
+                try:
+                    conn.execute("""
+                        INSERT INTO reactions (post_id, user_id, reaction_type)
+                        VALUES (?, ?, ?)
+                    """, (post_id, reactor_id, reaction_type))
+                except sqlite3.IntegrityError:
+                    pass
+        
+        # Add followers
+        for user_id in user_ids[:100]:
+            for _ in range(random.randint(2, 8)):
+                follower_id = random.choice(user_ids)
+                if follower_id != user_id:
+                    try:
+                        conn.execute("""
+                            INSERT INTO followers (user_id, follower_id)
+                            VALUES (?, ?)
+                        """, (user_id, follower_id))
+                    except sqlite3.IntegrityError:
+                        pass
+        
+        conn.commit()
+    
+    conn.close()
+
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+def sanitize(text):
+    return html.escape(text.strip()[:2000]) if text else ''
+
+def validate_email(email):
+    return re.match(r'^[\w\.-]+@[\w\.-]+\.\w+$', email)
+
+def validate_password(pw):
+    if len(pw) < 8:
+        return False
+    if not re.search(r'[A-Z]', pw):
+        return False
+    if not re.search(r'[0-9]', pw):
+        return False
+    if not re.search(r'[!@#$%^&*()_+\-=\[\]{};:\'",.<>?/\\|`~]', pw):
+        return False
+    return True
+
+def generate_csrf():
+    token = secrets.token_urlsafe(48)
+    session['csrf_token'] = token
+    return token
+
+def verify_csrf():
+    token = request.form.get('csrf_token') or request.headers.get('X-CSRF-Token')
+    return token and secrets.compare_digest(token, session.get('csrf_token', ''))
+
+def login_required(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        if 'user_id' not in session:
+            return redirect('/')
+        return f(*args, **kwargs)
+    return wrapper
+
+BASE_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Greeths</title>
+<meta name="csrf-token" content="{{ csrf_token }}">
+<style>
+:root {
+  --primary: {{ theme_color }};
+  --gradient: linear-gradient(135deg, {{ theme_color }} 0%, #2e7d32 100%);
+  --bg:#0a0a0a;
+  --card:#1a1a1a;
+  --text:#e4e6eb;
+  --border:#2a2a2a;
+  --green: {{ theme_color }};
+  --my-msg: {{ theme_color }};
+  --other-msg:#2a2a2a;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:var(--bg);color:var(--text)}
+header{background:var(--card);padding:12px 16px;position:sticky;top:0;z-index:100;border-bottom:1px solid var(--border)}
+.header-content{max-width:1200px;margin:0 auto;display:flex;justify-content:space-between;align-items:center;gap:10px}
+.logo{font-size:22px;font-weight:bold;background:var(--gradient);-webkit-background-clip:text;-webkit-text-fill-color:transparent;cursor:pointer}
+.hamburger{font-size:24px;cursor:pointer;background:var(--bg);border:1px solid var(--border);padding:6px 12px;border-radius:8px}
+.menu{display:none;position:absolute;right:12px;top:60px;background:var(--card);border:1px solid var(--border);border-radius:12px;padding:12px;min-width:200px;z-index:200}
+.menu.show{display:block}
+.menu a{display:block;padding:10px;color:var(--text);text-decoration:none;border-radius:8px}
+.menu a:hover{background:var(--bg)}
+.avatar{width:36px;height:36px;border:2px solid var(--primary);object-fit:cover;background:var(--bg);border-radius:50%}
+.avatar-lg{width:80px;height:80px;border:3px solid var(--primary);object-fit:cover;background:var(--bg);border-radius:50%;position:relative}
+.gender-badge{position:absolute;bottom:0;right:0;width:24px;height:24px;background:var(--primary);border-radius:50%;display:flex;align-items:center;justify-content:center;color:white;font-weight:bold;font-size:12px;border:2px solid var(--card)}
+.online-indicator{position:absolute;bottom:0;left:0;width:20px;height:20px;background:#00ff00;border-radius:50%;border:2px solid var(--card)}
+.container{max-width:700px;margin:16px auto;padding:0 12px}
+.card{background:var(--card);padding:16px;margin-bottom:12px;border:1px solid var(--border);border-radius:16px}
+.btn{background:var(--green);color:white;border:none;padding:10px 18px;border-radius:20px;font-weight:600;cursor:pointer;font-size:14px;transition:0.2s;position:relative}
+.btn:active{transform:scale(0.95)}
+.btn-emoji{padding:6px 10px;font-size:16px}
+.profile-header{text-align:center;padding:20px}
+.profile-info{display:flex;justify-content:center;gap:30px;margin-top:16px;padding:12px;background:var(--bg);border-radius:12px}
+.stat{text-align:center}
+.stat-label{font-size:12px;color:#8a8d91}
+.stat-value{font-size:18px;font-weight:bold;color:var(--primary)}
+.posts-scroll{display:flex;overflow-x:auto;gap:12px;padding:12px 0;scroll-behavior:smooth}
+.post-card{flex:0 0 200px;background:var(--bg);padding:12px;border:1px solid var(--border);border-radius:12px;cursor:pointer}
+.msg-box{height:65vh;overflow-y:auto;padding:16px;background:linear-gradient(180deg, #0f0f0f 0%, #1a1a1a 100%);border-radius:16px;scroll-behavior:smooth}
+.msg{margin:10px 0;display:flex;gap:8px;align-items:flex-end}
+.msg.me{justify-content:flex-end}
+.msg.other{justify-content:flex-start}
+.bubble{max-width:70%;padding:12px 16px;border-radius:20px;font-size:15px;line-height:1.4;word-wrap:break-word;box-shadow:0 2px 8px rgba(0,0,0,0.3);position:relative}
+.me.bubble{background:var(--my-msg);color:white;border-bottom-right-radius:6px}
+.other.bubble{background:var(--other-msg);color:var(--text);border:1px solid var(--border);border-bottom-left-radius:6px}
+.msg-avatar{width:28px;height:28px;border:1px solid var(--border);object-fit:cover;background:var(--bg);flex-shrink:0;border-radius:50%}
+.seen{font-size:11px;color:var(--primary);margin-top:3px;text-align:right;font-weight:600}
+.typing{font-size:13px;color:#8a8d91;margin:6px 0 8px 36px;display:flex;align-items:center;gap:4px}
+.typing-dots{display:flex;gap:3px}
+.typing-dots span{width:6px;height:6px;background:#8a8d91;border-radius:50%;animation:bounce 1.4s infinite}
+.typing-dots span:nth-child(2){animation-delay:0.2s}
+.typing-dots span:nth-child(3){animation-delay:0.4s}
+@keyframes bounce{0%,60%,100%{transform:translateY(0)}30%{transform:translateY(-8px)}}
+.avatar-sm{width:36px;height:36px;border:2px solid var(--border);object-fit:cover;background:var(--bg);margin-right:10px;border-radius:50%}
+.user-row{display:flex;gap:12px;align-items:center;padding:14px;border-bottom:1px solid var(--border);border-radius:12px}
+.user-row:last-child{border-bottom:none}
+input,textarea{width:100%;padding:12px 16px;border:1px solid var(--border);border-radius:24px;background:var(--bg);color:var(--text);font-size:15px;outline:none}
+input:focus,textarea:focus{border-color:var(--primary)}
+.chat-input-area{display:flex;gap:8px;margin-top:12px;align-items:center}
+.card img{max-width:100%;height:auto;display:block;margin-top:10px;border-radius:8px}
+.comment-box{margin-top:12px;padding-top:12px;border-top:1px solid var(--border)}
+.comment{font-size:14px;margin:6px 0;display:flex;gap:8px;align-items:flex-start}
+.comment-author{color:var(--primary);font-weight:600;cursor:pointer}
+.comment-author:hover{text-decoration:underline}
+.comment b{color:var(--primary)}
+.reaction-row{display:flex;gap:4px;flex-wrap:wrap}
+.follow-btn{padding:6px 12px;font-size:12px}
+</style>
+</head>
+<body>
+<header>
+  <div class="header-content">
+    <div class="logo" onclick="window.location.href='/feed'">greeths</div>
+    <div style="position:relative;margin-left:auto">
+      <div class="hamburger" onclick="document.getElementById('menu').classList.toggle('show')">☰</div>
+      <div id="menu" class="menu">
+        <a href="/profile">👤 Profile</a>
+        <a href="/friends">👥 Friends</a>
+        <a href="/messages">✉️ Messages</a>
+        <a href="/settings">⚙️ Settings</a>
+        <a href="/logout">🚪 Logout</a>
+      </div>
+    </div>
+  </div>
+</header>
+<div class="container">{{ content|safe }}</div>
+<script>
+const CSRF = document.querySelector('meta[name="csrf-token"]').content;
+async function post(url, data) {
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json', 'X-CSRF-Token': CSRF},
+    body: JSON.stringify(data)
+  });
+  return res.json();
+}
+async function reactComment(cid, type) {
+  await post('/react_comment/' + cid, {type: type});
+  location.reload();
+}
+async function reactMessage(mid, type) {
+  await post('/react_message/' + mid, {type: type});
+  location.reload();
+}
+</script>
+</body>
+</html>
+"""
+
+def render_page(content, logged_in=False):
+    uid = session.get('user_id')
+    theme = '#00c853'
+    if uid:
+        conn = get_db()
+        user = conn.execute("SELECT theme_color FROM users WHERE id=?", (uid,)).fetchone()
+        if user: theme = user['theme_color']
+        conn.close()
+    return render_template_string(BASE_TEMPLATE, content=content, csrf_token=session.get('csrf_token',''), logged_in=logged_in, theme_color=theme)
+
+@app.route('/uploads/<path:filename>')
+def uploaded_file(filename):
+    safe_filename = secure_filename(filename)
+    if safe_filename != filename:
+        abort(404)
+    return send_from_directory(app.config['UPLOAD_FOLDER'], safe_filename)
+
+@app.route('/', methods=['GET','POST'])
+@rate_limit
+def login():
+    if request.method == 'POST':
+        email = request.form.get('email','').lower().strip()
+        pw = request.form.get('password','')
+        if not verify_csrf():
+            abort(403)
+        conn = get_db()
+        user = conn.execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
+        conn.close()
+        if user and check_password_hash(user['password_hash'], pw):
+            session.clear()
+            session['user_id'] = user['id']
+            session['name'] = user['full_name']
+            session['pic'] = user['profile_pic']
+            generate_csrf()
+            with lock:
+                login_attempts.pop(request.remote_addr, None)
+            return redirect('/feed')
+        
+        ip = request.remote_addr
+        with lock:
+            attempts, _ = login_attempts.get(ip, (0, datetime.now()))
+            login_attempts[ip] = (attempts + 1, datetime.now())
+        error = "<p style='color:#ff3b30;margin-top:8px'>Invalid credentials</p>"
+    else:
+        error = ""
+        generate_csrf()
+
+    content = f"""
+    <div class="card" style="max-width:420px;margin:60px auto;text-align:center">
+        <h2 style="margin-bottom:24px;background:var(--gradient);-webkit-background-clip:text;-webkit-text-fill-color:transparent;font-size:28px">Welcome to Greeths</h2>
+        <form method="POST">
+            <input type="hidden" name="csrf_token" value="{session['csrf_token']}">
+            <input type="email" name="email" placeholder="Email" required style="margin-bottom:12px">
+            <input type="password" name="password" placeholder="Password" required style="margin-bottom:12px">
+            {error}
+            <button class="btn" style="width:100%;margin-top:8px">Log In</button>
+        </form>
+        <p style="text-align:center;margin-top:20px;color:#8a8d91">No account? <a href="/register" style="color:var(--primary);font-weight:600">Sign up</a></p>
+    </div>
+    """
+    return render_page(content, logged_in=False)
+
+@app.route('/register', methods=['GET','POST'])
+@rate_limit
+def register():
+    if request.method == 'POST':
+        name = sanitize(request.form.get('name',''))
+        email = request.form.get('email','').lower().strip()
+        pw = request.form.get('password','')
+        username = sanitize(request.form.get('username',''))
+        gender = request.form.get('gender', 'M')
+        age = request.form.get('age', '18')
+        if not verify_csrf():
+            abort(403)
+        if len(name) < 2 or not validate_password(pw) or len(username) < 3:
+            return "Name min 2, password 8+ chars with 1 uppercase + 1 number + 1 special char, username min 3 chars", 400
+        if not validate_email(email):
+            return "Invalid email", 400
+        try:
+            age = int(age)
+            if age < 13 or age > 120:
+                return "Age must be between 13 and 120", 400
+        except:
+            return "Invalid age", 400
+        
+        pic = 'default.png'
+        if 'profile_pic' in request.files:
+            file = request.files['profile_pic']
+            if file and file.filename and allowed_file(file.filename):
+                filename = str(uuid.uuid4()) + '.' + secure_filename(file.filename).rsplit('.',1)[1].lower()
+                file.save(os.path.join(app.config['UPLOAD_FOLDER'], filename))
+                pic = filename
+        conn = get_db()
+        try:
+            conn.execute("INSERT INTO users (full_name,email,password_hash,profile_pic,username,gender,age) VALUES (?,?,?,?,?,?,?)",
+                        (name, email, generate_password_hash(pw, method='scrypt'), pic, username, gender, age))
+            conn.commit()
+            return redirect('/')
+        except sqlite3.IntegrityError:
+            return "Email or username already exists", 400
+        finally:
+            conn.close()
+    generate_csrf()
+    content = f"""
+    <div class="card" style="max-width:420px;margin:60px auto">
+        <h2 style="margin-bottom:24px;text-align:center;background:var(--gradient);-webkit-background-clip:text;-webkit-text-fill-color:transparent">Create Account</h2>
+        <form method="POST" enctype="multipart/form-data">
+            <input type="hidden" name="csrf_token" value="{session['csrf_token']}">
+            <input type="text" name="name" placeholder="Full Name" required style="margin-bottom:12px">
+            <input type="text" name="username" placeholder="Username @user123" required style="margin-bottom:12px">
+            <input type="email" name="email" placeholder="Email" required style="margin-bottom:12px">
+            <input type="password" name="password" placeholder="8+ chars, 1 uppercase, 1 number, 1 special char" required style="margin-bottom:12px">
+            <div style="display:flex;gap:8px;margin-bottom:12px">
+                <select name="gender" style="flex:1;padding:12px 16px;border:1px solid var(--border);border-radius:24px;background:var(--bg);color:var(--text)">
+                    <option value="M">Male</option>
+                    <option value="F">Female</option>
+                </select>
+                <input type="number" name="age" placeholder="Age" min="13" max="120" value="18" required style="flex:1">
+            </div>
+            <label style="font-size:14px;color:#8a8d91">Profile Picture:</label>
+            <input type="file" name="profile_pic" accept="image/*" style="margin:8px 0 16px 0">
+            <button class="btn" style="width:100%">Sign Up</button>
+        </form>
+    </div>
+    """
+    return render_page(content, logged_in=False)
+
+@app.route('/profile')
+@login_required
+def profile():
+    uid = session['user_id']
+    conn = get_db()
+    user = conn.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+    followers_count = conn.execute("SELECT COUNT(*) as c FROM followers WHERE user_id=?", (uid,)).fetchone()['c']
+    
+    # Get stats
+    heart_count = conn.execute("SELECT COUNT(*) as c FROM reactions WHERE user_id IN (SELECT id FROM users WHERE id=?) AND reaction_type='heart'", (uid,)).fetchone()['c']
+    star_count = conn.execute("SELECT COUNT(*) as c FROM reactions WHERE user_id IN (SELECT id FROM users WHERE id=?) AND reaction_type='star'", (uid,)).fetchone()['c']
+    
+    # Get user's posts
+    posts = conn.execute("""
+        SELECT p.*, u.full_name, u.profile_pic, u.username, u.gender,
+        (SELECT COUNT(*) FROM reactions WHERE post_id=p.id AND reaction_type='heart') as heart_count,
+        (SELECT COUNT(*) FROM reactions WHERE post_id=p.id AND reaction_type='star') as star_count
+        FROM posts p JOIN users u ON p.user_id=u.id WHERE p.user_id=?
+        ORDER BY p.timestamp DESC
+    """, (uid,)).fetchall()
+    
+    conn.close()
+    
+    posts_html = ""
+    for p in posts:
+        heart = "❤️"
+        star = "⭐"
+        img = f'<img src="/uploads/{html.escape(p["image_path"])}" alt="Post image">' if p['image_path'] else ""
+        
+        conn = get_db()
+        comments = conn.execute("""
+            SELECT c.*, u.full_name, u.id as user_id FROM comments c 
+            JOIN users u ON c.user_id=u.id WHERE post_id=? 
+            ORDER BY timestamp
+        """, (p['id'],)).fetchall()
+        conn.close()
+        
+        comments_html = ""
+        for c in comments:
+            comment_author_link = f"<a href='/chat/{c['user_id']}' class='comment-author'>{html.escape(c['full_name'])}</a>"
+            comments_html += f'''
+            <div class="comment">
+                {comment_author_link}: {html.escape(c["content"])}
+            </div>'''
+        
+        posts_html += f"""
+        <div class="card">
+            <p style="margin:8px 0">{html.escape(p['content'] or '')}</p>
+            {img}
+            <div style="display:flex;gap:8px;margin-top:12px">
+                <button class="btn btn-emoji">{heart} {p['heart_count']}</button>
+                <button class="btn btn-emoji">{star} {p['star_count']}</button>
+            </div>
+            <div class="comment-box">
+                {comments_html}
+            </div>
+        </div>
+        """
+    
+    content = f"""
+    <div class="card profile-header">
+        <div style="position:relative;display:inline-block">
+            <img src="/uploads/{html.escape(user['profile_pic'])}" class="avatar-lg" alt="Profile">
+            <div class="gender-badge">{user['gender']}</div>
+            <div class="online-indicator"></div>
+        </div>
+        <h2 style="margin-top:16px">{html.escape(user['full_name'])}</h2>
+        <p style="color:#8a8d91;font-size:14px">@{html.escape(user['username'])}</p>
+        <p style="margin-top:8px;font-size:14px">{html.escape(user['bio'])}</p>
+        <div class="profile-info">
+            <div class="stat">
+                <div class="stat-value">{followers_count}</div>
+                <div class="stat-label">Greethers</div>
+            </div>
+            <div class="stat">
+                <div class="stat-value">{star_count}</div>
+                <div class="stat-label">Stars</div>
+            </div>
+            <div class="stat">
+                <div class="stat-value">{heart_count}</div>
+                <div class="stat-label">Hearts</div>
+            </div>
+        </div>
+        <div style="margin-top:16px;display:flex;gap:8px;justify-content:center">
+            <button class="btn" onclick="window.location.href='/edit-profile'">Edit Profile</button>
+            <button class="btn" onclick="alert('Post deleted!')" style="background:#ff3b30">Delete Post</button>
+        </div>
+    </div>
+    <h3 style="margin:20px 0 12px 0;color:var(--primary)">Your Posts</h3>
+    {posts_html}
+    """
+    return render_page(content, logged_in=True)
+
+@app.route('/edit-profile', methods=['GET','POST'])
+@login_required
+def edit_profile():
+    uid = session['user_id']
+    conn = get_db()
+    user = conn.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+    conn.close()
+    
+    if request.method == 'POST':
+        if not verify_csrf():
+            abort(403)
+        bio = sanitize(request.form.get('bio',''))
+        theme_color = request.form.get('theme_color','#00c853')
+        
+        conn = get_db()
+        conn.execute("UPDATE users SET bio=?, theme_color=? WHERE id=?", (bio, theme_color, uid))
+        conn.commit()
+        conn.close()
+        return redirect('/profile')
+    
+    generate_csrf()
+    content = f"""
+    <div class="card" style="max-width:500px;margin:40px auto">
+        <h2 style="margin-bottom:20px">Edit Profile</h2>
+        <form method="POST">
+            <input type="hidden" name="csrf_token" value="{session['csrf_token']}">
+            <label style="font-size:14px;color:#8a8d91;display:block;margin-bottom:8px">Bio</label>
+            <textarea name="bio" placeholder="Tell us about yourself" maxlength="500" style="margin-bottom:12px;height:100px">{html.escape(user['bio'] or '')}</textarea>
+            <label style="font-size:14px;color:#8a8d91;display:block;margin-bottom:8px">Theme Color</label>
+            <input type="color" name="theme_color" value="{user['theme_color']}" style="margin-bottom:16px;width:100%;height:40px;border:1px solid var(--border);border-radius:8px;cursor:pointer">
+            <button class="btn" style="width:100%">Save Changes</button>
+        </form>
+    </div>
+    """
+    return render_page(content, logged_in=True)
+
+@app.route('/feed', methods=['GET','POST'])
+@login_required
+def feed():
+    uid = session['user_id']
+    if request.method == 'POST':
+        if not verify_csrf():
+            abort(403)
+        content = sanitize(request.form.get('content',''))
+        image_path = None
+        if 'image' in request.files:
+            file = request.files['image']
+            if file and file.filename and allowed_file(file.filename):
+                filename = str(uuid.uuid4()) + '.' + secure_filename(file.filename).rsplit('.',1)[1].lower()
+                file.save(os.path.join(app.config['UPLOAD_FOLDER'], filename))
+                image_path = filename
+        if content or image_path:
+            conn = get_db()
+            conn.execute("INSERT INTO posts (user_id, content, image_path) VALUES (?,?,?)", (uid, content, image_path))
+            conn.commit()
+            conn.close()
+
+    conn = get_db()
+    posts = conn.execute("""
+        SELECT p.*, u.full_name, u.profile_pic, u.username, u.gender, u.id as user_id,
+        (SELECT COUNT(*) FROM reactions WHERE post_id=p.id AND reaction_type='heart') as heart_count,
+        (SELECT COUNT(*) FROM reactions WHERE post_id=p.id AND reaction_type='star') as star_count,
+        (SELECT reaction_type FROM reactions WHERE post_id=p.id AND user_id=?) as my_reaction
+        FROM posts p JOIN users u ON p.user_id=u.id
+        ORDER BY p.timestamp DESC LIMIT 50
+    """, (uid,)).fetchall()
+
+    user_data = conn.execute("SELECT username FROM users WHERE id=?", (uid,)).fetchone()
+    my_username = user_data['username'] if user_data else 'user'
+    conn.close()
+
+    posts_html = ""
+    for p in posts:
+        heart = "❤️" if p['my_reaction']=='heart' else "🤍"
+        star = "⭐" if p['my_reaction']=='star' else "☆"
+        img = f'<img src="/uploads/{html.escape(p["image_path"])}" alt="Post image">' if p['image_path'] else ""
+
+        conn = get_db()
+        comments = conn.execute("""
+            SELECT c.*, u.full_name, u.id as user_id FROM comments c 
+            JOIN users u ON c.user_id=u.id WHERE post_id=? 
+            ORDER BY timestamp
+        """, (p['id'],)).fetchall()
+        conn.close()
+
+        comments_html = ""
+        for c in comments:
+            comment_author_link = f"<a href='/chat/{c['user_id']}' class='comment-author'>{html.escape(c['full_name'])}</a>"
+            comments_html += f'''
+            <div class="comment">
+                {comment_author_link}: {html.escape(c["content"])}
+            </div>'''
+
+        posts_html += f"""
+        <div class="card">
+            <div style="display:flex;align-items:center;margin-bottom:12px">
+                <img src="/uploads/{html.escape(p['profile_pic'])}" class="avatar-sm" alt="Avatar">
+                <div>
+                    <b>{html.escape(p['full_name'])}</b><br>
+                    <small style="color:#8a8d91">@{html.escape(p['username'])} • {p['gender']}</small>
+                </div>
+                <button class="btn follow-btn" style="margin-left:auto;background:#ff3b30" onclick="addFollower({p['user_id']})">+ Follow</button>
+            </div>
+            <p style="margin:8px 0">{html.escape(p['content'] or '')}</p>
+            {img}
+            <div style="display:flex;gap:8px;margin-top:12px">
+                <form method="POST" action="/react/{p['id']}/heart" style="position:relative;flex:1">
+                    <input type="hidden" name="csrf_token" value="{session['csrf_token']}">
+                    <button class="btn btn-emoji" style="width:100%">{heart} {p['heart_count']}</button>
+                </form>
+                <form method="POST" action="/react/{p['id']}/star" style="position:relative;flex:1">
+                    <input type="hidden" name="csrf_token" value="{session['csrf_token']}">
+                    <button class="btn btn-emoji" style="width:100%">{star} {p['star_count']}</button>
+                </form>
+            </div>
+            <div class="comment-box">
+                {comments_html}
+                <form method="POST" action="/comment/{p['id']}" style="display:flex;gap:8px;margin-top:8px">
+                    <input type="hidden" name="csrf_token" value="{session['csrf_token']}">
+                    <input type="text" name="comment" placeholder="Add comment..." style="flex:1;padding:8px 12px;border-radius:16px;font-size:14px">
+                    <button class="btn btn-emoji">💬</button>
+                </form>
+            </div>
+        </div>
+        """
+
+    content = f"""
+    <div class="card">
+        <form method="POST" enctype="multipart/form-data">
+            <input type="hidden" name="csrf_token" value="{session['csrf_token']}">
+            <textarea name="content" placeholder="What's on your mind?" rows="2" maxlength="1000"></textarea>
+            <div style="display:flex;gap:8px;margin-top:10px">
+                <input type="file" name="image" accept="image/*" style="flex:1;font-size:12px">
+                <button class="btn btn-emoji">📝</button>
+            </div>
+        </form>
+    </div>
+    {posts_html}
+    <script>
+    async function addFollower(userId) {{
+        await post('/follow/' + userId, {{}});
+        location.reload();
+    }}
+    </script>
+    """
+    return render_page(content, logged_in=True)
+
+@app.route('/follow/<int:user_id>', methods=['POST'])
+@login_required
+def follow(user_id):
+    if not verify_csrf():
+        abort(403)
+    uid = session['user_id']
+    conn = get_db()
+    try:
+        conn.execute("INSERT INTO followers (user_id, follower_id) VALUES (?, ?)", (user_id, uid))
+        conn.commit()
+    except sqlite3.IntegrityError:
+        pass
+    conn.close()
+    return jsonify({"ok": True})
+
+@app.route('/react/<int:post_id>/<reaction>', methods=['POST'])
+@login_required
+def react(post_id, reaction):
+    if not verify_csrf():
+        abort(403)
+    if reaction not in ['heart', 'star']:
+        abort(400)
+    uid = session['user_id']
+    conn = get_db()
+    existing = conn.execute("SELECT * FROM reactions WHERE post_id=? AND user_id=? AND reaction_type=?", (post_id, uid, reaction)).fetchone()
+    if existing:
+        conn.execute("DELETE FROM reactions WHERE post_id=? AND user_id=? AND reaction_type=?", (post_id, uid, reaction))
+    else:
+        conn.execute("INSERT INTO reactions (post_id, user_id, reaction_type) VALUES (?,?,?)", (post_id, uid, reaction))
+    conn.commit()
+    conn.close()
+    return redirect('/feed')
+
+@app.route('/react_comment/<int:cid>', methods=['POST'])
+@login_required
+def react_comment(cid):
+    if not verify_csrf():
+        abort(403)
+    uid = session['user_id']
+    data = request.get_json()
+    reaction = data.get('type')
+    if reaction not in ['heart', 'star']:
+        abort(400)
+    conn = get_db()
+    existing = conn.execute("SELECT * FROM comment_reactions WHERE comment_id=? AND user_id=? AND reaction_type=?", (cid, uid, reaction)).fetchone()
+    if existing:
+        conn.execute("DELETE FROM comment_reactions WHERE comment_id=? AND user_id=? AND reaction_type=?", (cid, uid, reaction))
+    else:
+        conn.execute("INSERT INTO comment_reactions (comment_id, user_id, reaction_type) VALUES (?,?,?)", (cid, uid, reaction))
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True})
+
+@app.route('/react_message/<int:mid>', methods=['POST'])
+@login_required
+def react_message(mid):
+    if not verify_csrf():
+        abort(403)
+    uid = session['user_id']
+    data = request.get_json()
+    reaction = data.get('type')
+    if reaction not in ['heart', 'star']:
+        abort(400)
+    conn = get_db()
+    existing = conn.execute("SELECT * FROM message_reactions WHERE message_id=? AND user_id=? AND reaction_type=?", (mid, uid, reaction)).fetchone()
+    if existing:
+        conn.execute("DELETE FROM message_reactions WHERE message_id=? AND user_id=? AND reaction_type=?", (mid, uid, reaction))
+    else:
+        conn.execute("INSERT INTO message_reactions (message_id, user_id, reaction_type) VALUES (?,?,?)", (mid, uid, reaction))
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True})
+
+@app.route('/comment/<int:post_id>', methods=['POST'])
+@login_required
+def comment(post_id):
+    if not verify_csrf():
+        abort(403)
+    uid = session['user_id']
+    content = sanitize(request.form.get('comment',''))
+    if content:
+        conn = get_db()
+        conn.execute("INSERT INTO comments (post_id, user_id, content) VALUES (?,?,?)", (post_id, uid, content))
+        conn.commit()
+        conn.close()
+    return redirect('/feed')
+
+@app.route('/api/typing/<int:friend_id>', methods=['POST'])
+@login_required
+def set_typing(friend_id):
+    uid = session['user_id']
+    with lock:
+        typing_status[(uid, friend_id)] = time.time()
+    return jsonify({"ok": True})
+
+@app.route('/api/messages/<int:friend_id>')
+@login_required
+def get_messages(friend_id):
+    uid = session['user_id']
+    conn = get_db()
+    conn.execute("UPDATE messages SET is_read=1 WHERE from_user=? AND to_user=?", (friend_id, uid))
+    msgs = conn.execute("""
+        SELECT m.*, u.profile_pic, u.full_name
+        FROM messages m JOIN users u ON m.from_user=u.id
+        WHERE (from_user=? AND to_user=?) OR (from_user=? AND to_user=?)
+        ORDER BY timestamp
+    """, (uid,friend_id,friend_id,uid)).fetchall()
+
+    typing = False
+    key = (friend_id, uid)
+    with lock:
+        if key in typing_status and time.time() - typing_status[key] < 3:
+            typing = True
+
+    conn.close()
+    return jsonify({
+        "messages": [dict(m) for m in msgs],
+        "typing": typing
+    })
+
+@app.route('/api/msg_reacts/<int:mid>')
+@login_required
+def msg_reacts(mid):
+    uid = session['user_id']
+    conn = get_db()
+    heart = conn.execute("SELECT COUNT(*) as c FROM message_reactions WHERE message_id=? AND reaction_type='heart'", (mid,)).fetchone()['c']
+    star = conn.execute("SELECT COUNT(*) as c FROM message_reactions WHERE message_id=? AND reaction_type='star'", (mid,)).fetchone()['c']
+    my_heart = conn.execute("SELECT 1 FROM message_reactions WHERE message_id=? AND user_id=? AND reaction_type='heart'", (mid, uid)).fetchone()
+    my_star = conn.execute("SELECT 1 FROM message_reactions WHERE message_id=? AND user_id=? AND reaction_type='star'", (mid, uid)).fetchone()
+    conn.close()
+    return jsonify({"heart": heart, "star": star, "my_heart": bool(my_heart), "my_star": bool(my_star)})
+
+@app.route('/chat/<int:friend_id>', methods=['GET','POST'])
+@login_required
+def chat(friend_id):
+    uid = session['user_id']
+    conn = get_db()
+    friend = conn.execute("SELECT * FROM users WHERE id=?", (friend_id,)).fetchone()
+    user_data = conn.execute("SELECT username FROM users WHERE id=?", (uid,)).fetchone()
+    my_username = user_data['username'] if user_data else 'user'
+
+    if request.method == 'POST':
+        if not verify_csrf():
+            abort(403)
+        
+        if request.is_json:
+            data = request.get_json()
+            if data.get('typing'):
+                with lock:
+                    typing_status[(uid, friend_id)] = time.time()
+                conn.close()
+                return jsonify({"ok": True})
+            content = sanitize(data.get('content',''))
+        else:
+            content = sanitize(request.form.get('content',''))
+        
+        if content:
+            conn.execute("INSERT INTO messages (from_user, to_user, content) VALUES (?,?,?)", (uid, friend_id, content))
+            conn.commit()
+        conn.close()
+        return jsonify({"ok": True})
+
+    content = f"""
+    <div class="card">
+        <div style="display:flex;align-items:center;margin-bottom:16px;padding-bottom:12px;border-bottom:1px solid var(--border)">
+            <img src="/uploads/{html.escape(friend['profile_pic'])}" class="avatar" alt="Avatar">
+            <div style="margin-left:12px">
+                <h3 style="margin:0">{html.escape(friend['full_name'])}</h3>
+                <small style="color:#8a8d91">Active now</small>
+            </div>
+        </div>
+        <div class="msg-box" id="msgBox"></div>
+        <div id="typingIndicator" class="typing" style="display:none">
+            <img src="/uploads/{html.escape(friend['profile_pic'])}" class="msg-avatar" alt="Avatar">
+            <span>{html.escape(friend['full_name'])} is typing</span>
+            <div class="typing-dots"><span></span><span></span><span></span></div>
+        </div>
+        <div class="chat-input-area">
+            <input type="text" id="msgInput" placeholder="Type a message...">
+            <button onclick="sendMsg()" class="btn btn-emoji">📤</button>
+        </div>
+    </div>
+    <script>
+        let typingTimer;
+        async function loadMsgs() {{
+            const data = await fetch('/api/messages/{friend_id}').then(r=>r.json());
+            const box = document.getElementById('msgBox');
+            const typingDiv = document.getElementById('typingIndicator');
+
+            let html = '';
+            for(let idx=0; idx<data.messages.length; idx++) {{
+                const m = data.messages[idx];
+                const isMe = m.from_user == {uid};
+                const cls = isMe? 'me' : 'other';
+                let avatar = isMe? '' : `<img src="/uploads/${{m.profile_pic}}" class="msg-avatar" alt="Avatar">`;
+                let seen = '';
+                if(isMe && m.is_read == 1 && idx == data.messages.length-1) {{
+                    seen = '<div class="seen">Seen ✓</div>';
+                }}
+
+                const res = await fetch('/api/msg_reacts/' + m.id);
+                const reacts = await res.json();
+                let reactHtml = `<div class="reaction-row" style="margin-top:4px">
+                    <button class="btn btn-emoji" onclick="reactMessage(${{m.id}},'heart')">${{reacts.my_heart?'❤️':'🤍'}} ${{reacts.heart}}</button>
+                    <button class="btn btn-emoji" onclick="reactMessage(${{m.id}},'star')">${{reacts.my_star?'⭐':'☆'}} ${{reacts.star}}</button>
+                </div>`;
+
+                html += `<div class="msg ${{cls}}">${{avatar}}<div class="bubble">${{m.content}}${{reactHtml}}</div>${{seen}}</div>`;
+            }}
+            box.innerHTML = html;
+            typingDiv.style.display = data.typing? 'flex' : 'none';
+            box.scrollTop = box.scrollHeight;
+        }}
+
+        async function sendTyping() {{
+            await post('/chat/{friend_id}', {{typing: true}});
+        }}
+
+        async function sendMsg() {{
+            const input = document.getElementById('msgInput');
+            if(!input.value.trim()) return;
+            await post('/chat/{friend_id}', {{content: input.value}});
+            input.value = '';
+            loadMsgs();
+        }}
+
+        document.getElementById('msgInput').addEventListener('keypress', e => {{
+            if(e.key==='Enter') sendMsg();
+        }});
+
+        document.getElementById('msgInput').addEventListener('input', () => {{
+            clearTimeout(typingTimer);
+            sendTyping();
+            typingTimer = setTimeout(() => {{}}, 3000);
+        }});
+
+        loadMsgs();
+        setInterval(loadMsgs, 1000);
+    </script>
+    """
+    conn.close()
+    return render_page(content, logged_in=True)
+
+@app.route('/messages')
+@login_required
+def messages():
+    uid = session['user_id']
+    conn = get_db()
+    users = conn.execute("SELECT * FROM users WHERE id!=?", (uid,)).fetchall()
+    user_data = conn.execute("SELECT username FROM users WHERE id=?", (uid,)).fetchone()
+    my_username = user_data['username'] if user_data else 'user'
+    conn.close()
+
+    html = '<div class="card"><h2 style="margin-bottom:16px;background:var(--gradient);-webkit-background-clip:text;-webkit-text-fill-color:transparent">Messages</h2>'
+    if not users:
+        html += '<p style="color:#8a8d91;text-align:center;padding:40px 20px">No other users yet.</p>'
+    else:
+        for u in users:
+            conn = get_db()
+            last_msg = conn.execute("SELECT * FROM messages WHERE (from_user=? AND to_user=?) OR (from_user=? AND to_user=?) ORDER BY timestamp DESC LIMIT 1", (uid,u['id'],u['id'],uid)).fetchone()
+            unread = conn.execute("SELECT COUNT(*) as c FROM messages WHERE from_user=? AND to_user=? AND is_read=0", (u['id'],uid)).fetchone()['c']
+            conn.close()
+            preview = last_msg['content'][:30] + '...' if last_msg and len(last_msg['content']) > 30 else last_msg['content'] if last_msg else "Start a conversation"
+            badge = f'<span style="background:#ff3b30;color:white;border-radius:12px;padding:2px 8px;font-size:12px;font-weight:600">{unread}</span>' if unread > 0 else ""
+            html += f'''
+            <a href="/chat/{u["id"]}" style="text-decoration:none;color:inherit">
+                <div class="user-row">
+                    <img src="/uploads/{html.escape(u["profile_pic"])}" class="avatar-sm" alt="Avatar">
+                    <div style="flex:1">
+                        <b>{html.escape(u["full_name"])}</b><br>
+                        <small style="color:#8a8d91">{html.escape(preview)}</small>
+                    </div>
+                    {badge}
+                </div>
+            </a>
+            '''
+    html += '</div>'
+    return render_page(html, logged_in=True)
+
+@app.route('/friends')
+@login_required
+def friends():
+    uid = session['user_id']
+    conn = get_db()
+    users = conn.execute("SELECT * FROM users WHERE id!=?", (uid,)).fetchall()
+    conn.close()
+
+    html = '<div class="card"><h2 style="margin-bottom:16px;background:var(--gradient);-webkit-background-clip:text;-webkit-text-fill-color:transparent">Friends</h2>'
+    if not users:
+        html += '<p style="color:#8a8d91;text-align:center;padding:40px 20px">No friends yet.</p>'
+    else:
+        for u in users:
+            html += f'''
+            <div class="user-row">
+                <img src="/uploads/{html.escape(u["profile_pic"])}" class="avatar-sm" alt="Avatar">
+                <div style="flex:1">
+                    <b>{html.escape(u["full_name"])}</b><br>
+                    <small style="color:#8a8d91">@{html.escape(u["username"])} • {u["gender"]}</small>
+                </div>
+                <a href="/chat/{u["id"]}"><button class="btn btn-emoji">💬</button></a>
+            </div>
+            '''
+    html += '</div>'
+    return render_page(html, logged_in=True)
+
+@app.route('/settings')
+@login_required
+def settings():
+    content = """
+    <div class="card" style="max-width:500px;margin:40px auto">
+        <h2 style="margin-bottom:20px">Settings</h2>
+        <a href="/edit-profile" style="text-decoration:none">
+            <button class="btn" style="width:100%;margin-bottom:8px">Edit Profile</button>
+        </a>
+        <a href="/logout" style="text-decoration:none">
+            <button class="btn" style="width:100%;background:#ff3b30">Logout</button>
+        </a>
+    </div>
+    """
+    return render_page(content, logged_in=True)
+
+@app.route('/logout')
+def logout():
+    session.clear()
+    return redirect('/')
+
+if __name__ == '__main__':
+    # Create demo users on first run
+    conn = get_db()
+    user_count = conn.execute("SELECT COUNT(*) as c FROM users").fetchone()['c']
+    conn.close()
+    
+    if user_count < 10:
+        print("🔄 Creating 100+ demo users...")
+        create_demo_users_in_db()
+        print("✅ Demo users created!")
+    
+    print("🔒 Greeths v10.0 ⭐❤️ with Full Profile System Running!")
+    print("→ http://127.0.0.1:5000")
+    print("\n📝 Demo Users Available:")
+    conn = get_db()
+    demo_users_list = conn.execute("SELECT full_name, email FROM users LIMIT 5").fetchall()
+    for u in demo_users_list:
+        print(f"   {u['full_name']} ({u['email']})")
+    conn.close()
+    print("   ... and 100+ more!")
+    
+    app.run(host='0.0.0.0', port=5000, debug=False)
